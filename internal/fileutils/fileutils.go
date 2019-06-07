@@ -12,10 +12,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
 
 	"github.com/ActiveState/cli/internal/failures"
 	"github.com/ActiveState/cli/internal/locale"
-	"github.com/ActiveState/cli/internal/logging"
 )
 
 // nullByte represents the null-terminator byte
@@ -41,11 +43,8 @@ const (
 
 type includeFunc func(path string, contents []byte) (include bool)
 
-type replaceAllJob struct {
-	filename string
-	find     string
-	replace  string
-	include  includeFunc
+func always(string, []byte) bool {
+	return true
 }
 
 // ReplaceAll replaces all instances of search text with replacement text in a
@@ -111,40 +110,115 @@ func ReplaceAll(filename, find string, replace string, include includeFunc) erro
 	return WriteFile(filename, buffer.Bytes()).ToError()
 }
 
-func replaceAllWorker(jobs <-chan replaceAllJob, errors chan<- bool) {
-	for job := range jobs {
-		err := ReplaceAll(job.filename, job.find, job.replace, job.include)
+func gatherPaths(path string) ([]string, error) {
+	// behavior test
+	var ps []string
+	err := filepath.Walk(path, func(path string, f os.FileInfo, err error) error {
 		if err != nil {
-			logging.Debug("Error during ReplaceAll: %v", err)
-			errors <- true
+			return err
+		}
+		if f.IsDir() {
+			return nil
+		}
+		ps = append(ps, path)
+		return nil
+	})
+	return ps, err
+}
+
+func producePaths(paths []string) <-chan string {
+	// unit test
+	psc := make(chan string)
+	go func() {
+		defer close(psc)
+		for _, path := range paths {
+			psc <- path
+		}
+	}()
+	return psc
+}
+
+type pathDigestError struct {
+	path string
+	err  error
+}
+
+type digestPathFunc func(esc chan<- pathDigestError, path string)
+
+func findAndReplaceFunc(find, replace string, incFn includeFunc) digestPathFunc {
+	// behavior test - maybe just not test
+	return func(esc chan<- pathDigestError, path string) {
+		if err := ReplaceAll(path, find, replace, incFn); err != nil {
+			esc <- pathDigestError{path, err}
 		}
 	}
 }
 
+func spread(width int, fn func()) {
+	// unit test
+	for i := 0; i < width; i++ {
+		go fn()
+	}
+}
+
+func consumePaths(width int, psc <-chan string, digest digestPathFunc) <-chan pathDigestError {
+	// unit test
+	esc := make(chan pathDigestError)
+
+	go func() {
+		defer close(esc)
+
+		var wg sync.WaitGroup
+		wg.Add(width)
+
+		spread(width, func() {
+			for path := range psc {
+				digest(esc, path)
+			}
+			wg.Done()
+		})
+
+		wg.Wait()
+	}()
+
+	return esc
+}
+
+func processPathDigestErrors(esc <-chan pathDigestError) error {
+	// unit test
+	var paths []string
+	for e := range esc {
+		paths = append(paths, e.path)
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	return fmt.Errorf("cannot process paths: %s", strings.Join(paths, ", "))
+}
+
+func lessCount(n, ct int) int {
+	// unit test
+	n -= ct
+	if n < 0 {
+		n = 1
+	}
+	return n
+}
+
 // ReplaceAllInDirectory walks the given directory and invokes ReplaceAll on each file
 func ReplaceAllInDirectory(path, find string, replace string, include includeFunc) error {
-	jobs := make(chan replaceAllJob)
-	errors := make(chan bool)
-
-	for i := 0; i <= 10; i++ {
-		go replaceAllWorker(jobs, errors)
+	// behavior test - maybe just not test, but probably
+	ps, err := gatherPaths(path)
+	if err != nil {
+		return err
 	}
 
-	filepath.Walk(path, func(path string, f os.FileInfo, err error) error {
-		if f.IsDir() {
-			return nil
-		}
-		jobs <- replaceAllJob{path, find, replace, include}
-		return nil
-	})
-	close(jobs)
-	close(errors)
+	width := lessCount(runtime.NumCPU(), 2)
 
-	if <-errors {
-		return failures.FailIO.New("err_replaceall_check_log")
-	}
+	psc := producePaths(ps)
+	errs := consumePaths(width, psc, findAndReplaceFunc(find, replace, include))
 
-	return nil
+	return processPathDigestErrors(errs)
 }
 
 // IsBinary checks if the given bytes are for a binary file
